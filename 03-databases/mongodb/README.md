@@ -70,6 +70,12 @@ db.users.createIndex({ phone: 1 }, { sparse: true })
 
 // Unique
 db.users.createIndex({ email: 1 }, { unique: true })
+
+// Partial index (only index documents matching a filter expression)
+db.orders.createIndex(
+  { createdAt: 1 },
+  { partialFilterExpression: { status: "pending" } }
+)
 ```
 
 ---
@@ -110,6 +116,31 @@ db.orders.aggregate([
   // Stage 7: reshape output
   { $project: { country: "$_id", totalRevenue: 1, orderCount: 1, _id: 0 } }
 ])
+```
+
+### Useful Pipeline Stages
+
+```js
+// $addFields: add computed fields without replacing the document
+{ $addFields: { fullName: { $concat: ["$firstName", " ", "$lastName"] } } }
+
+// $facet: run multiple sub-pipelines in parallel (for faceted search)
+{ $facet: {
+  byCategory: [{ $group: { _id: "$category", count: { $sum: 1 } } }],
+  byStatus:   [{ $group: { _id: "$status",   count: { $sum: 1 } } }],
+  total:      [{ $count: "n" }]
+}}
+
+// $bucket: group values into ranges
+{ $bucket: {
+  groupBy: "$total",
+  boundaries: [0, 50, 100, 500, 1000],
+  default: "1000+",
+  output: { count: { $sum: 1 }, avgTotal: { $avg: "$total" } }
+}}
+
+// $merge / $out: write pipeline results to a collection
+{ $merge: { into: "monthly_summary", on: "month", whenMatched: "replace" } }
 ```
 
 ---
@@ -172,6 +203,39 @@ const orders = await Order
   .lean()  // returns plain JS objects, not Mongoose documents (faster)
 ```
 
+### Aggregation in Mongoose
+
+```typescript
+interface RevenueByCountry {
+  country: string
+  totalRevenue: number
+  orderCount: number
+}
+
+const result = await Order.aggregate<RevenueByCountry>([
+  { $match: { status: 'completed' } },
+  {
+    $lookup: {
+      from: 'users',
+      localField: 'userId',
+      foreignField: '_id',
+      as: 'user',
+    },
+  },
+  { $unwind: '$user' },
+  {
+    $group: {
+      _id: '$user.country',
+      totalRevenue: { $sum: '$amount' },
+      orderCount: { $count: {} },
+    },
+  },
+  { $sort: { totalRevenue: -1 } },
+  { $limit: 10 },
+  { $project: { country: '$_id', totalRevenue: 1, orderCount: 1, _id: 0 } },
+])
+```
+
 ---
 
 ## Transactions
@@ -193,26 +257,88 @@ try {
 }
 ```
 
+**When not to use multi-document transactions**: if you need transactions frequently, your schema is wrong. Re-evaluate whether you should embed instead of reference — a single atomic document update never needs a transaction.
+
+---
+
+## Query Patterns
+
+```js
+// Find with projection (only return needed fields)
+db.users.find({ status: "active" }, { name: 1, email: 1, _id: 0 })
+
+// Comparison operators
+db.orders.find({ total: { $gte: 100, $lt: 500 } })
+db.users.find({ role: { $in: ["admin", "moderator"] } })
+db.events.find({ type: { $nin: ["heartbeat", "ping"] } })
+
+// Array operators
+db.posts.find({ tags: { $all: ["nodejs", "backend"] } })  // contains all
+db.posts.find({ tags: { $elemMatch: { $regex: /^node/ } } })  // element matches
+db.posts.find({ "tags.2": { $exists: true } })  // array has at least 3 elements
+
+// Update operators
+db.users.updateOne({ _id: id }, {
+  $set: { name: "Bob" },        // set fields
+  $unset: { oldField: "" },     // remove field
+  $inc: { loginCount: 1 },      // increment numeric
+  $push: { tags: "new-tag" },   // append to array
+  $pull: { tags: "old-tag" },   // remove from array
+  $addToSet: { tags: "unique" } // append only if not present
+})
+
+// FindOneAndUpdate (returns updated document)
+const updated = await User.findOneAndUpdate(
+  { _id: id },
+  { $inc: { credits: -10 } },
+  { new: true, runValidators: true }  // return updated doc, run schema validators
+)
+```
+
 ---
 
 ## Common Performance Mistakes
 
-1. **No index on query fields** — MongoDB does a collection scan
-2. **Unbounded arrays** — grows past 16MB document limit
-3. **Not using projection** — fetching entire documents when you need 2 fields
-4. **$where queries** — runs JavaScript, can't use indexes
-5. **Not using lean()** — Mongoose hydrates documents; `.lean()` returns raw objects (2-10x faster for reads)
-6. **Missing compound index direction** — `{ a: 1, b: -1 }` is different from `{ a: 1, b: 1 }` for sort
+1. **No index on query fields** — MongoDB does a collection scan (COLLSCAN). Use `explain()` to detect.
+2. **Unbounded arrays** — grows past 16MB document limit. Use a referenced collection instead.
+3. **Not using projection** — fetching entire documents when you need 2 fields wastes memory and bandwidth.
+4. **`$where` queries** — runs JavaScript engine, cannot use indexes.
+5. **Not using `lean()`** — Mongoose hydrates documents into full Model instances. `.lean()` returns raw objects (2-10x faster for reads where you don't need Mongoose instance methods).
+6. **Missing compound index direction** — `{ a: 1, b: -1 }` is different from `{ a: 1, b: 1 }` for sort.
+7. **`$lookup` on unindexed foreignField** — same as an unindexed JOIN. Always index the field you're looking up on.
+8. **No `$match` early in pipeline** — put `$match` as the first stage so it can use indexes before processing every document.
+
+```js
+// Debug: check if a query uses an index
+db.orders.find({ status: "pending" }).explain("executionStats")
+// Look for: winningPlan.stage = "IXSCAN" (good) vs "COLLSCAN" (bad)
+// Look for: totalDocsExamined vs totalDocsReturned — ratio should be close to 1:1
+```
 
 ---
 
 ## Interview Questions
 
 **Q: When would you choose MongoDB over PostgreSQL?**
-MongoDB fits when: schema is genuinely variable (different attributes per document), you're working with nested/hierarchical data that maps naturally to documents, development speed is more important than strict consistency, you're doing event logging or time-series data. PostgreSQL fits for: relational data, financial data requiring ACID, complex reporting with joins, anything where schema integrity matters.
+MongoDB fits when: schema is genuinely variable (different attributes per document), you're working with nested/hierarchical data that maps naturally to documents, development speed is more important than strict consistency, you're doing event logging or time-series data. PostgreSQL fits for: relational data, financial data requiring ACID, complex reporting with joins, anything where schema integrity matters. If uncertain, PostgreSQL with JSONB columns gives you most of MongoDB's flexibility with relational guarantees.
 
 **Q: How do you handle many-to-many relationships in MongoDB?**
 Two common approaches: (1) Store an array of references in both documents — query each side separately. (2) Create a join collection just like SQL. The right choice depends on query patterns — if you always traverse one direction, embed the IDs in that document only.
 
 **Q: What is the aggregation pipeline and how is it different from map-reduce?**
 The aggregation pipeline is a series of transformation stages applied in order. It runs natively in C++ inside the database engine and is far faster than map-reduce (JavaScript). Pipeline stages can use indexes, pipeline operations are composable, and the execution plan is optimizable. Map-reduce is largely deprecated in modern MongoDB.
+
+**Q: Why do MongoDB multi-document transactions require a replica set?**
+MongoDB's transaction implementation uses the oplog (operation log) for coordination and rollback, which is a replica set concept. Even a single-node deployment must be configured as a one-member replica set to use multi-document transactions. In practice, production MongoDB should always be on a replica set for HA anyway.
+
+**Q: What does `lean()` do and when should you use it?**
+By default, Mongoose wraps query results in full `Document` instances with methods like `save()`, `validate()`, and populated virtuals. `lean()` tells Mongoose to return plain JavaScript objects instead — no hydration overhead. Use `lean()` whenever you only need to read data (API responses, data pipelines). Avoid `lean()` when you need to call `save()`, use virtuals, or run Mongoose middleware on the result.
+
+---
+
+## Related
+
+- [SQL](../sql/README.md) — relational model, joins, window functions
+- [PostgreSQL](../postgresql/README.md) — JSONB for semi-structured data in a relational DB
+- [Transactions](../transactions/README.md) — ACID, sagas, distributed transactions
+- [Indexing](../indexing/README.md) — index concepts (B-tree, partial, compound) apply to MongoDB too
